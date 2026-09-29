@@ -767,13 +767,179 @@ body {
   padding-top: 2px;
 }
 
-/* ---------------- 字幕列表 + 断行排版 侧栏 ---------------- */
+/* ---------------- 字幕列表 + 断行排版 / 短句合并 侧栏 ---------------- */
 
 .side {
   flex: 0 0 auto;
   display: flex;
   min-height: 0;
   min-width: 0;
+}
+
+/* 右侧文本工具容器：页签 + 面板（面板自身去掉左边框与固定宽度） */
+.side-tool {
+  width: 360px;
+  flex: 0 0 360px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  background: var(--bg-panel);
+  border-left: 1px solid var(--line);
+}
+
+.side-tabs {
+  display: flex;
+  flex: 0 0 auto;
+  border-bottom: 1px solid var(--line);
+}
+
+.side-tabs button {
+  flex: 1 1 0;
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+  padding: 8px 10px;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  position: relative;
+}
+
+.side-tabs button:hover {
+  color: var(--text);
+  background: #1c2640;
+}
+
+.side-tabs button.active {
+  color: #b9d6ff;
+  border-bottom-color: #5b8cff;
+  font-weight: 600;
+}
+
+.side-tab-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 5px;
+  border-radius: 50%;
+  background: #6fdc9b;
+  vertical-align: middle;
+}
+
+.side-tool .reflow-panel {
+  width: auto;
+  flex: 1 1 auto;
+  border-left: 0;
+  min-height: 0;
+}
+
+/* 短句合并面板 */
+.merge-params {
+  gap: 8px 12px;
+}
+
+.merge-param {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.merge-param input {
+  width: 58px;
+  padding: 3px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: #0e1424;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.merge-param-unit {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.merge-reset {
+  margin-left: auto;
+}
+
+.merge-row.single {
+  opacity: 0.85;
+}
+
+.merge-row.short .merge-time {
+  color: #ffd28a;
+}
+
+.merge-badge.short {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  color: #ffd28a;
+  background: rgba(120, 80, 16, 0.35);
+  white-space: nowrap;
+}
+
+.merge-dur {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.merge-time {
+  font-size: 11px;
+  color: #9ec1ff;
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 4px;
+}
+
+.merge-members {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 2px 0 5px;
+  padding: 4px 6px;
+  border-left: 2px solid rgba(91, 140, 255, 0.55);
+  background: rgba(58, 92, 158, 0.1);
+  border-radius: 0 4px 4px 0;
+}
+
+.merge-member {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.merge-member-time {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.merge-member-text {
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.merge-too-large {
+  margin: 10px 12px;
+  padding: 8px 10px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #ffb4b4;
+  background: rgba(80, 24, 24, 0.22);
+  border-radius: 6px;
 }
 
 /* 断行排版面板：停靠在字幕列表旁 */

@@ -3,6 +3,7 @@ import Toolbar from './components/Toolbar';
 import Timeline from './components/Timeline';
 import CueList from './components/CueList';
 import ReflowPanel from './components/ReflowPanel';
+import MergePanel from './components/MergePanel';
 import ShadowPanel from './components/ShadowPanel';
 import DriftPanel from './components/DriftPanel';
 import RefDiffPanel from './components/RefDiffPanel';
@@ -40,6 +41,13 @@ import {
   normalizeReflowOptions,
   type ReflowOptions
 } from './lib/reflow';
+import {
+  applyMerge,
+  buildMergePlan,
+  DEFAULT_MERGE_OPTIONS,
+  normalizeMergeOptions,
+  type MergeOptions
+} from './lib/merge';
 import type { Constraints, Cue, DriftPreview, SilenceStatus } from './types';
 import { formatClock, parseSrt, serializeSrt } from './lib/srt';
 import {
@@ -190,6 +198,12 @@ export default function App() {
   // 断行排版：每行最大宽度与最多行数（仅页面内存，不进会话快照）；
   // 预览随当前字幕与参数立即重算，应用时只改文本并作为一次历史操作
   const [reflowOptions, setReflowOptions] = useState<ReflowOptions>(DEFAULT_REFLOW_OPTIONS);
+
+  // 侧栏文本工具页签：断行排版 / 短句合并（仅页面内存）
+  const [sideTab, setSideTab] = useState<'reflow' | 'merge'>('reflow');
+  // 短句合并：短字幕阈值 / 相邻最大间隔 / 合并后最长时长 / 最大字素数（仅页面内存）；
+  // 全局最优分组预览随当前字幕与参数立即重算，应用作为一次历史操作
+  const [mergeOptions, setMergeOptions] = useState<MergeOptions>(DEFAULT_MERGE_OPTIONS);
 
   /* ---------------- 本地会话恢复 / 自动保存 ---------------- */
   // 当前工作区绑定的会话 id：导入 SRT 时新建；恢复会话时沿用；空白工作区为 null
@@ -468,6 +482,13 @@ export default function App() {
   const reflowPlan = useMemo(
     () => (cues.length > 0 ? buildReflowPlan(cues, reflowOptions) : null),
     [cues, reflowOptions]
+  );
+
+  // 短句合并：全局最优分组预览（含超限不参与原因与仍短条目）。
+  // 纯只读计算，随当前字幕或四项参数立即重算，不写撤销历史
+  const mergePlan = useMemo(
+    () => (cues.length > 0 ? buildMergePlan(cues, mergeOptions) : null),
+    [cues, mergeOptions]
   );
 
   const seek = useCallback(
@@ -960,6 +981,42 @@ export default function App() {
     setFocusNonce((n) => n + 1);
   }, []);
 
+  /* ---------------- 短句合并 ---------------- */
+
+  /** 参数变更：夹取合法范围后立即触发预览重算 */
+  const handleMergeOptionsChange = useCallback((next: MergeOptions) => {
+    setMergeOptions(normalizeMergeOptions(next));
+  }, []);
+
+  /**
+   * 一次应用全部合并分组：合并组取首条起点 / 末条终点与连接文本、以首条 id
+   * 作为结果 id（被并入条目删除），单条保留对象引用不变。作为一次历史操作
+   * 提交，支持整体撤销 / 重做；现有 SRT 导出按结果重新编号输出。
+   */
+  const applyMergeAll = useCallback(() => {
+    if (!mergePlan || mergePlan.mergedAway === 0) return;
+    const next = applyMerge(cues, mergePlan);
+    if (!next) return;
+    // 选中项与其他面板选择可能已被并入其他组：提交后校正到仍存在的 id，避免悬空选择
+    const nextIds = new Set(next.map((c) => c.id));
+    if (selectedId && !nextIds.has(selectedId)) {
+      setSelectedId(next[0]?.id ?? null);
+    }
+    if (speedSelectedId && !nextIds.has(speedSelectedId)) setSpeedSelectedId(null);
+    if ((driftAnchorId && !nextIds.has(driftAnchorId)) || (driftEndId && !nextIds.has(driftEndId))) clearDrift();
+    commit(next);
+    pushToast(
+      'info',
+      `已应用短句合并：${mergePlan.mergedGroupCount} 个分组 · 消去 ${mergePlan.mergedAway} 条 · 结果 ${mergePlan.resultCount} 条（仍短 ${mergePlan.remainingShort} 条）`
+    );
+  }, [mergePlan, cues, selectedId, speedSelectedId, driftAnchorId, driftEndId, clearDrift, commit, pushToast]);
+
+  /** 点击合并预览分组：选中并滚动列表 / 时间轴到该组首条 */
+  const handleMergeLocate = useCallback((cueId: string) => {
+    setSelectedId(cueId);
+    setFocusNonce((n) => n + 1);
+  }, []);
+
   /* ---------------- 本地会话：自动保存 / 恢复 / 删除 ---------------- */
 
   /** 组装一次完整快照（字幕 + 撤销/重做历史 + 约束 + 视图 + 音频指纹） */
@@ -1309,6 +1366,9 @@ export default function App() {
     if (activityGaps && activityGaps.gaps.length > 0) {
       parts.push(`疑似未覆盖音频活动 ${activityGaps.gaps.length} 段`);
     }
+    if (mergePlan && mergePlan.mergedAway > 0) {
+      parts.push(`短句合并预览：消去 ${mergePlan.mergedAway} 条（仍短 ${mergePlan.remainingShort}）`);
+    }
     if (audioPending) parts.push('等待重新选择音频（播放已停用，编辑/导出不受影响）');
     if (sessionId) {
       if (!autoSave) parts.push('自动保存已停用');
@@ -1338,7 +1398,8 @@ export default function App() {
     refStats,
     speedOverEntries,
     speedThreshold,
-    activityGaps
+    activityGaps,
+    mergePlan
   ]);
 
   return (
@@ -1531,14 +1592,50 @@ export default function App() {
             onExtendRange={handleExtendDriftRange}
             onSeek={seekAndPlay}
           />
-          <ReflowPanel
-            cueCount={cues.length}
-            options={reflowOptions}
-            onOptionsChange={handleReflowOptionsChange}
-            plan={reflowPlan}
-            onApply={applyReflowAll}
-            onLocate={handleReflowLocate}
-          />
+          <div className="side-tool">
+            <div className="side-tabs" role="tablist" aria-label="文本工具">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={sideTab === 'reflow'}
+                className={sideTab === 'reflow' ? 'active' : ''}
+                onClick={() => setSideTab('reflow')}
+                title="批量重排字幕文本中的换行与空白（时间码不变）"
+              >
+                断行排版
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={sideTab === 'merge'}
+                className={sideTab === 'merge' ? 'active' : ''}
+                onClick={() => setSideTab('merge')}
+                title="把被切成数条的相邻短句按参数合并为一条"
+              >
+                短句合并
+                {mergePlan && mergePlan.mergedAway > 0 ? <span className="side-tab-dot" title="当前参数下有可合并分组" /> : null}
+              </button>
+            </div>
+            {sideTab === 'reflow' ? (
+              <ReflowPanel
+                cueCount={cues.length}
+                options={reflowOptions}
+                onOptionsChange={handleReflowOptionsChange}
+                plan={reflowPlan}
+                onApply={applyReflowAll}
+                onLocate={handleReflowLocate}
+              />
+            ) : (
+              <MergePanel
+                cueCount={cues.length}
+                options={mergeOptions}
+                onOptionsChange={handleMergeOptionsChange}
+                plan={mergePlan}
+                onApply={applyMergeAll}
+                onLocate={handleMergeLocate}
+              />
+            )}
+          </div>
         </div>
       </main>
 

@@ -37,7 +37,8 @@ export interface SessionViewState {
 
 /**
  * 一条完整会话快照。past / present / future 与 cues.ts 的 HistoryState 同构，
- * 这里独立声明为持久化类型（id 集合必须一致，恢复后撤销栈仍可逐步回放）。
+ * 这里独立声明为持久化类型（边界拖动等编辑保持 id 集合一致；短句合并只删除
+ * 被并入条目的 id，历史帧集合形成一条包含链，恢复后撤销栈仍可逐步回放）。
  */
 export interface SessionSnapshot {
   past: CueSnapshot[][];
@@ -158,11 +159,35 @@ function readCueStack(v: unknown): { ok: true; value: CueSnapshot[] } | { ok: fa
   return { ok: true, value: out };
 }
 
-/** 要求两帧字幕的 id 集合完全一致（历史栈只允许时间码差异） */
-function sameCueIds(a: CueSnapshot[], b: CueSnapshot[]): boolean {
-  if (a.length !== b.length) return false;
-  const ids = new Set(a.map((c) => c.id));
-  return b.every((c) => ids.has(c.id));
+/**
+ * 历史帧之间允许的 id 集合关系：
+ * 边界拖动 / 漂移 / 阅读速度 / 断行排版等操作保持 id 集合不变；
+ * **短句合并**会删除被并入条目（结果条沿用组首条 id），因此沿历史方向 id 只减不增。
+ * 撤销 / 重做栈中较新帧（present 之后提交）的 id 集合必须是较旧帧的子集；
+ * 这里无法获知帧的提交先后，故只要求任意两帧的 id 集合满足**一方包含另一方**，
+ * 且 present 的每个 id 都在所有帧中出现过（present 不引入任何历史中不存在的新 id）。
+ */
+function compatibleCueIds(frames: CueSnapshot[][], present: CueSnapshot[]): boolean {
+  const presentIds = new Set(present.map((c) => c.id));
+  const sets = frames.map((f) => new Set(f.map((c) => c.id)));
+  for (const ids of sets) {
+    // present 不得有该帧之外的新 id
+    for (const id of presentIds) {
+      if (!ids.has(id)) return false;
+    }
+  }
+  // 任意两帧集合须互为子集（合并只会删除 id，历史链上的帧集合应形成一条包含链）。
+  // 两两可比较的集合按大小排序后必成全序，故只需排序后逐对验证「小集 ⊆ 大集」，
+  // 等大的两集必须完全相等。
+  const ordered = [...sets].sort((a, b) => a.size - b.size);
+  for (let k = 1; k < ordered.length; k += 1) {
+    const small = ordered[k - 1];
+    const large = ordered[k];
+    for (const id of small) {
+      if (!large.has(id)) return false;
+    }
+  }
+  return true;
 }
 
 function readAudio(v: unknown): { ok: true; value: AudioFingerprint | null } | { ok: false; reason: string } {
@@ -277,14 +302,16 @@ export function validateSession(raw: unknown): { ok: true; record: SessionRecord
   ];
   const past: CueSnapshot[][] = [];
   const future: CueSnapshot[][] = [];
+  const checkedFrames: CueSnapshot[][] = [];
   for (const f of frames) {
     const r = readCueStack(f.raw);
     if (!r.ok) return { ok: false, reason: `${f.name}：${r.reason}` };
-    if (!sameCueIds(r.value, present)) {
-      return { ok: false, reason: `${f.name}的字幕集合与当前不一致` };
-    }
+    checkedFrames.push(r.value);
     if (f.name.startsWith('撤销')) past.push(r.value);
     else future.push(r.value);
+  }
+  if (!compatibleCueIds(checkedFrames, present)) {
+    return { ok: false, reason: '历史帧的字幕集合不兼容（短句合并之外的编辑不得增删字幕 id）' };
   }
 
   const viewR = readView(raw.view, cueIds);
