@@ -3,6 +3,7 @@ import Toolbar from './components/Toolbar';
 import Timeline from './components/Timeline';
 import CueList from './components/CueList';
 import ReflowPanel from './components/ReflowPanel';
+import MergePanel from './components/MergePanel';
 import ShadowPanel from './components/ShadowPanel';
 import DriftPanel from './components/DriftPanel';
 import RefDiffPanel from './components/RefDiffPanel';
@@ -40,6 +41,13 @@ import {
   normalizeReflowOptions,
   type ReflowOptions
 } from './lib/reflow';
+import {
+  applyMerge,
+  buildMergePlan,
+  DEFAULT_MERGE_OPTIONS,
+  normalizeMergeOptions,
+  type MergeOptions
+} from './lib/merge';
 import type { Constraints, Cue, DriftPreview, SilenceStatus } from './types';
 import { formatClock, parseSrt, serializeSrt } from './lib/srt';
 import {
@@ -190,6 +198,10 @@ export default function App() {
   // 断行排版：每行最大宽度与最多行数（仅页面内存，不进会话快照）；
   // 预览随当前字幕与参数立即重算，应用时只改文本并作为一次历史操作
   const [reflowOptions, setReflowOptions] = useState<ReflowOptions>(DEFAULT_REFLOW_OPTIONS);
+
+  // 短句合并：短字幕阈值 / 相邻最大间隔 / 合并后最长时长 / 最大字素数（仅页面内存，
+  // 不进会话快照）；预览随当前字幕与参数立即重算，应用整体作为一次历史操作
+  const [mergeOptions, setMergeOptions] = useState<MergeOptions>(DEFAULT_MERGE_OPTIONS);
 
   /* ---------------- 本地会话恢复 / 自动保存 ---------------- */
   // 当前工作区绑定的会话 id：导入 SRT 时新建；恢复会话时沿用；空白工作区为 null
@@ -468,6 +480,13 @@ export default function App() {
   const reflowPlan = useMemo(
     () => (cues.length > 0 ? buildReflowPlan(cues, reflowOptions) : null),
     [cues, reflowOptions]
+  );
+
+  // 短句合并：全部字幕的全局最优分组预览（含禁合并条目原因）。
+  // 纯只读计算，随字幕或阈值 / 间隔 / 时长 / 字素数参数立即重算，不写撤销历史
+  const mergePlan = useMemo(
+    () => (cues.length > 0 ? buildMergePlan(cues, mergeOptions) : null),
+    [cues, mergeOptions]
   );
 
   const seek = useCallback(
@@ -956,6 +975,41 @@ export default function App() {
 
   /** 点击排版预览条目：选中并滚动列表 / 时间轴到该字幕 */
   const handleReflowLocate = useCallback((cueId: string) => {
+    setSelectedId(cueId);
+    setFocusNonce((n) => n + 1);
+  }, []);
+
+  /* ---------------- 短句合并 ---------------- */
+
+  /** 参数变更：夹取合法范围（毫秒精度 / 正整数字素数）后立即触发预览重算 */
+  const handleMergeOptionsChange = useCallback((next: MergeOptions) => {
+    setMergeOptions(normalizeMergeOptions(next));
+  }, []);
+
+  /**
+   * 一次应用全部合并分组：每个分组产生一条新字幕（首起点 / 末终点 / 空格连接文本），
+   * 组内其余条目删除，作为一次历史操作提交，支持整体撤销 / 重做；
+   * 禁合并（自身超时长 / 超字数）的条目原样保留。无任何多组分词时计划不会触发提交。
+   */
+  const applyMergeAll = useCallback(() => {
+    if (!mergePlan || mergePlan.mergedAwayCount === 0) return;
+    const next = applyMerge(cues, mergePlan);
+    if (!next) return;
+    // 原选中条目若被并入某组（其 id 已消失），选中落到该组首条以免选中悬空
+    if (selectedId && !next.some((c) => c.id === selectedId)) {
+      const group = mergePlan.groups.find((g) => g.memberIds.includes(selectedId));
+      setSelectedId(group ? group.memberIds[0] : next[0]?.id ?? null);
+      setFocusNonce((n2) => n2 + 1);
+    }
+    commit(next);
+    pushToast(
+      'info',
+      `已应用短句合并：${mergePlan.mergedGroupCount} 个分组合并 · 消去 ${mergePlan.mergedAwayCount} 条 · 结果 ${mergePlan.resultCount} 条（仍短句 ${mergePlan.shortCount} 条）`
+    );
+  }, [mergePlan, cues, selectedId, commit, pushToast]);
+
+  /** 点击合并预览分组：选中首条并滚动列表 / 时间轴 */
+  const handleMergeLocate = useCallback((cueId: string) => {
     setSelectedId(cueId);
     setFocusNonce((n) => n + 1);
   }, []);
@@ -1538,6 +1592,14 @@ export default function App() {
             plan={reflowPlan}
             onApply={applyReflowAll}
             onLocate={handleReflowLocate}
+          />
+          <MergePanel
+            cueCount={cues.length}
+            options={mergeOptions}
+            onOptionsChange={handleMergeOptionsChange}
+            plan={mergePlan}
+            onApply={applyMergeAll}
+            onLocate={handleMergeLocate}
           />
         </div>
       </main>

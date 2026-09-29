@@ -76,6 +76,12 @@ import {
   buildReflowPlan,
   normalizeReflowOptions
 } from '../src/lib/reflow';
+import {
+  DEFAULT_MERGE_OPTIONS,
+  applyMerge,
+  buildMergePlan,
+  normalizeMergeOptions
+} from '../src/lib/merge';
 import { splitGraphemes } from '../src/lib/readingSpeed';
 
 let fail = 0;
@@ -1412,6 +1418,252 @@ assert(validateSession(nullAudio).ok, '无音频指纹的会话合法');
   const blank = buildReflowPlan([{ id: 'a', start: 0, end: 1, text: '   \n\t ' }], { maxWidth: 10, maxLines: 2 });
   assert(blank.entries[0].ok && blank.entries[0].newText === '', '纯空白文本可排版为空文本（0 行）');
   assert(blank.changedCount === 1, '纯空白 -> 空串属于文本变化，会被改为空');
+}
+
+/* ---------------- 短句合并 ---------------- */
+
+const MOPTS = { shortThreshold: 1, maxGap: 0.3, maxDuration: 7, maxChars: 30 };
+
+// 45. 基本合并：相邻、不重叠、间隔不超限的短条目被合并为首起点 / 末终点 / 空格连接
+{
+  const mc = [
+    { id: 'a', start: 0, end: 0.5, text: '你好' },
+    { id: 'b', start: 0.7, end: 1.2, text: '世界' },
+    { id: 'c', start: 5, end: 8, text: '一条够长的普通字幕不需要参与任何合并动作' }
+  ];
+  const plan = buildMergePlan(mc, MOPTS);
+  assert(plan.resultCount === 2, `两条短句合并 + 一条长句单留 = 2 组（实际 ${plan.resultCount}）`);
+  assert(plan.mergedAwayCount === 1 && plan.mergedGroupCount === 1, '合并掉 1 条、1 个合并组');
+  assert(plan.shortCount === 0, '合并后 1.2s 不再是短句，短句结果为 0');
+  const g = plan.groups[0];
+  assert(g.merged && g.memberIds.join('') === 'ab', '首组含 a、b');
+  assert(g.start === 0 && g.end === 1.2 && Math.abs(g.durationMs - 1200) === 0, '时间码取首起点 0 / 末终点 1.2');
+  assert(g.text === '你好 世界', `文本去空白后单空格连接（实际 "${g.text}"）`);
+  assert(g.chars === 5 && g.members.length === 2, '字素数 5（含连接空格），含两条明细');
+  assert(plan.groups[1].memberIds[0] === 'c' && !plan.groups[1].merged, '长句单条保留');
+  assert(plan.excludedCount === 0, '无禁合并条目');
+}
+
+// 46. 只合并不重叠且间隔不超限的相邻条目：重叠不合并；间隔恰为上限可合并，超过不合并
+{
+  const mc = [
+    { id: 'a', start: 0, end: 0.5, text: '甲' },
+    { id: 'b', start: 0.5, end: 0.9, text: '乙' },          // 端点相接：间隙 0，可合并
+    { id: 'c', start: 1.2, end: 1.5, text: '丙' },          // 距 b 恰 0.3，可合并
+    { id: 'd', start: 1.81, end: 1.95, text: '丁' },        // 距 c 0.31 > 0.3，断开
+    { id: 'e', start: 1.95, end: 2.2, text: '戊' }          // 与 d 时间重叠（d.end=e.start 相接，实际非重叠）
+  ];
+  const plan = buildMergePlan(mc, MOPTS);
+  assert(plan.groups[0].memberIds.join('') === 'abc', '相接与间隔恰 0.3 可合并：abc 同组');
+  assert(plan.groups[1].memberIds.join('') === 'de', '间隔 0.31 超限：d 不并入前组，de 相接另成组');
+
+  // 真正重叠：end > next.start，任何分组合法性都不成立
+  const ov = [
+    { id: 'a', start: 0, end: 0.6, text: '甲' },
+    { id: 'b', start: 0.55, end: 0.9, text: '乙' }
+  ];
+  const op = buildMergePlan(ov, MOPTS);
+  assert(op.resultCount === 2 && op.mergedAwayCount === 0, '重叠条目不合并（应用按钮应禁用）');
+  assert(op.groups[0].short && op.groups[1].short, '无法消去的短句各自保留并仍标记短句');
+}
+
+// 47. 全局目标 1：先最小化结果中的短句条数（跨越「保留短组」的局部贪心）
+{
+  // a 0~0.4(短) b 0.6~0.9(短)：ab 时长 0.9 仍短；
+  // c 1.1~1.6(不短，0.5s)：abc 时长 1.6 不短 → 必须带上 c 才能消短句
+  const mc = [
+    { id: 'a', start: 0, end: 0.4, text: '甲' },
+    { id: 'b', start: 0.6, end: 0.9, text: '乙' },
+    { id: 'c', start: 1.1, end: 1.6, text: '丙' }
+  ];
+  const plan = buildMergePlan(mc, MOPTS);
+  assert(plan.shortCount === 0, '带上不短的 c 后短句数为 0（最优目标）');
+  assert(plan.groups.length === 1 && plan.groups[0].memberIds.join('') === 'abc', '最优为 abc 一整组');
+}
+
+// 48. 全局目标 2：短句数相同时最小化被合并掉的条数（组数尽量多，不做无收益合并）
+{
+  // a、b 合并后 1.1s 已不短；c 0.5s 短且与 b 间隔 0.5 超限无法被救 → 短句数恒为 1。
+  // 两种方案短句数相同：[ab][c]（合并掉 1 条）优于 [abc]（合并掉 2 条），但间隔 0.5 本身已断开；
+  // 改用同间隔内构造：a0~0.6 b0.8~1.3（ab=1.3 不短），c1.5~1.9（abc=1.9 不短，c 单条 0.4 短）
+  const mc = [
+    { id: 'a', start: 0, end: 0.6, text: '甲' },
+    { id: 'b', start: 0.8, end: 1.3, text: '乙' },
+    { id: 'c', start: 1.5, end: 1.9, text: '丙' }
+  ];
+  const plan = buildMergePlan(mc, MOPTS);
+  // [ab][c]：短句 1（c），合并掉 1；[abc]：短句 0（1.9s 不短）→ 目标 1 优先，仍应整组
+  assert(plan.shortCount === 0 && plan.groups[0].memberIds.join('') === 'abc', '消短句优先：abc 整组');
+
+  // 真正同分：a0~0.6 b0.8~1.3（ab 1.3 不短）；c1.5~2.6（c 单条 1.1 不短，abc 2.6 不短）
+  const mc2 = [
+    { id: 'a', start: 0, end: 0.6, text: '甲' },
+    { id: 'b', start: 0.8, end: 1.3, text: '乙' },
+    { id: 'c', start: 1.5, end: 2.6, text: '一条本身就不短的字幕' }
+  ];
+  const p2 = buildMergePlan(mc2, MOPTS);
+  // [ab][c] 与 [abc] 短句数都为 0；前者合并掉 1、后者合并掉 2 → 取 [ab][c]
+  assert(p2.shortCount === 0 && p2.resultCount === 2, '短句数同为 0：取组数更多（合并掉更少）的方案');
+  assert(p2.groups[0].memberIds.join('') === 'ab' && p2.groups[1].memberIds[0] === 'c', '分组为 [ab][c]');
+  assert(p2.mergedAwayCount === 1, '只合并掉 1 条');
+}
+
+// 49. 全局目标 3：仍同分取断点序列字典序最小（断点尽量靠前 / 更早合并）
+{
+  // a0~0.4(短) b0.6~1.2(0.8 短) c1.4~2.0(0.6 短)，阈值 1：
+  // ab=1.2 不短、bc=1.4 不短、abc=2.0 不短。
+  // 方案 [ab][c]：短句 1（c 0.6）；[a][bc]：短句 1（a 0.4）；[abc]：短句 0 → 整组赢。
+  // 构造同短句数同分：a0~0.6(0.6短) b0.8~1.4(0.6短) c1.6~2.2(0.6短)，
+  // [ab][c] 与 [a][bc] 都是 1 短句、合并 1 次 → 断点向量 (2,3) vs (1,3)，取更早断点 [ab][c]
+  const mc = [
+    { id: 'a', start: 0, end: 0.6, text: '甲' },
+    { id: 'b', start: 0.8, end: 1.4, text: '乙' },
+    { id: 'c', start: 1.6, end: 2.2, text: '丙' }
+  ];
+  const plan = buildMergePlan(mc, MOPTS);
+  // [abc] 2.2s 不短 → 短句 0，仍是目标 1 的最优（整组）
+  assert(plan.shortCount === 0, '三句整组 2.2s 不短，短句 0');
+
+  // 用最长时长 1.5s 禁止三句整组：[ab]=1.4 可行、[bc]=1.4 可行、[abc]=2.2 超时不可行
+  const limited = buildMergePlan(mc, { ...MOPTS, maxDuration: 1.5 });
+  assert(limited.shortCount === 1, '时长封顶后最优仍剩 1 短句');
+  assert(limited.resultCount === 2, '两种可行方案都合并掉 1 条、剩 2 组');
+  // 断点 = 组之间的分割位置（不合并处）：[a|bc] 的断点在 1，[ab|c] 的断点在 2，
+  // 断点序列字典序最小 / 更早断点即分割尽量靠前 → [a][bc]
+  assert(
+    limited.groups[0].memberIds.join('') === 'a' && limited.groups[1].memberIds.join('') === 'bc',
+    `同分取更早断点：分割点 1 早于 2 → [a][bc]（实际 [${limited.groups.map((g) => g.memberIds.join('')).join('][')}]）`
+  );
+}
+
+// 50. 时长 / 字数上限：超限组不成立；自身超限的条目不参与合并并说明原因
+{
+  const long = [
+    { id: 'a', start: 0, end: 0.5, text: '短' },
+    { id: 'b', start: 0.7, end: 6.9, text: '一条自身就接近时长上限的长长字幕内容在这里' }
+  ];
+  // b 自身 6.2s 未超 7s，但 ab 组 6.9s 也未超 → 可以合并
+  const ok = buildMergePlan(long, MOPTS);
+  assert(ok.groups[0].memberIds.join('') === 'ab' && ok.excludedCount === 0, '组时长恰为 6.9s ≤ 7s 可合并');
+
+  const over = [
+    { id: 'a', start: 0, end: 0.5, text: '短' },
+    { id: 'b', start: 0.7, end: 8.2, text: '一条自身时长超过七秒上限的字幕所以禁止参与合并哦' }
+  ];
+  const op = buildMergePlan(over, MOPTS);
+  assert(op.excludedCount === 1 && op.entries[1].eligible === false, 'b 自身 7.5s > 7s：禁合并');
+  assert(op.entries[1].reasonKind === 'duration', '原因归类 duration');
+  assert(op.entries[1].reason?.includes('最长时长') ?? false, '原因文案说明时长超限');
+  assert(op.resultCount === 2 && op.mergedAwayCount === 0, '禁合并条目把 run 切断：无分组发生');
+  assert(op.groups.map((g) => g.memberIds[0]).join('') === 'ab', '两条均以单条组保留');
+
+  // 字数超限：maxChars=3
+  const chars = buildMergePlan(
+    [
+      { id: 'a', start: 0, end: 0.5, text: '你' },
+      { id: 'b', start: 0.7, end: 1.2, text: 'ABCD' } // 自身 4 字素 > 3
+    ],
+    { ...MOPTS, maxChars: 3 }
+  );
+  assert(chars.entries[1].eligible === false && chars.entries[1].reasonKind === 'chars', '自身 4 字素 > 上限 3：chars 禁合并');
+  // a 自身 1 字素可合并，但唯一邻居 b 被排除 → 无法合并
+  assert(chars.mergedAwayCount === 0, '可合并条目没有可连接的邻居时单条保留');
+
+  // 组字数超限但单条均不超限：不得成组
+  const groupChars = buildMergePlan(
+    [
+      { id: 'a', start: 0, end: 0.5, text: '甲乙' },
+      { id: 'b', start: 0.7, end: 1.2, text: '丙丁' } // 连接后 "甲乙 丙丁" = 5 字素 > 4
+    ],
+    { ...MOPTS, maxChars: 4 }
+  );
+  assert(groupChars.excludedCount === 0, '单条均未超 4 字素：无条目被禁');
+  assert(groupChars.mergedAwayCount === 0, '组合并后 5 字素超限：不合并（预览不产生该组）');
+}
+
+// 51. 文本规则：各条去首尾空白后以单个空格连接；字数按 Unicode 字素簇
+{
+  const mc = [
+    { id: 'a', start: 0, end: 0.5, text: '  你好\t世界 \n' },
+    { id: 'b', start: 0.7, end: 1.2, text: '\n👨‍👩‍👧 加油 ' }
+  ];
+  const plan = buildMergePlan(mc, MOPTS);
+  // 规格只要求「各条去首尾空白后以单空格连接」：条目内部的制表符 / 换行原样保留
+  assert(plan.groups[0].text === '你好\t世界 👨‍👩‍👧 加油', `各自 trim、条间单空格、条内空白保留（实际 "${plan.groups[0].text}"）`);
+  // 字素：你好(2)+\t(1)+世界(2) + 条间空格(1) + emoji ZWJ(1) + 空格(1) + 加油(2) = 10
+  assert(plan.groups[0].chars === 10, `ZWJ 家庭序列算 1 字素（实际 ${plan.groups[0].chars}）`);
+}
+
+// 52. 应用：合并后 cue 数减少、id 取首条、时间码与文本正确；作为一次历史可撤销 / 重做并可导出
+{
+  const mc = [
+    { id: 'a', start: 0, end: 0.5, text: '你好' },
+    { id: 'b', start: 0.7, end: 1.2, text: '世界' },
+    { id: 'c', start: 2, end: 3, text: '独立' }
+  ];
+  const plan = buildMergePlan(mc, MOPTS);
+  const mapped = applyMerge(mc, plan)!;
+  assert(mapped.length === 2, `合并后 2 条（实际 ${mapped.length}）`);
+  assert(mapped[0].id === 'a' && mapped[0].start === 0 && mapped[0].end === 1.2, '首条 id / 首起点 / 末终点');
+  assert(mapped[0].text === '你好 世界', '连接文本');
+  assert(mapped[1].id === 'c' && mapped[1].start === 2 && mapped[1].end === 3 && mapped[1].text === '独立', '独立条保留原时间码与文本');
+  assert(mc.length === 3 && mc[0].end === 0.5, '原数组不被修改');
+  assert(applyMerge(mc, buildMergePlan([mc[2]], MOPTS)) === null, '没有多组合并时 applyMerge 返回 null');
+
+  let h = initHistory(mc);
+  h = commitHistory(h, mapped);
+  assert(h.past.length === 1 && h.present.length === 2, '合并作为一次历史提交');
+  h = undoHistory(h);
+  assert(h.present.length === 3 && h.present[0].text === '你好', '撤销整体还原被合并条目');
+  h = redoHistory(h);
+  assert(h.present.length === 2 && h.present[0].text === '你好 世界', '重做恢复合并结果');
+  const out = serializeSrt(h.present);
+  assert(
+    out.includes('00:00:00,000 --> 00:00:01,200') && out.includes('你好 世界'),
+    '现有 SRT 导出反映合并后的时间码与文本'
+  );
+  const outNums = [...out.matchAll(/^(\d+)$/gm)].map((m) => Number(m[1]));
+  assert(JSON.stringify(outNums) === '[1,2]', '导出按结果连续编号 1,2');
+}
+
+// 53. 参数夹取与默认值；无字幕 / 空文本边界
+{
+  assert(
+    DEFAULT_MERGE_OPTIONS.shortThreshold === 1 &&
+      DEFAULT_MERGE_OPTIONS.maxGap === 0.3 &&
+      DEFAULT_MERGE_OPTIONS.maxDuration === 7 &&
+      DEFAULT_MERGE_OPTIONS.maxChars === 30,
+    '默认参数：阈值 1s / 间隔 0.3s / 最长 7s / 30 字素'
+  );
+  const n = normalizeMergeOptions({ shortThreshold: -5, maxGap: 999, maxDuration: NaN, maxChars: 0 });
+  assert(n.shortThreshold === 0 && n.maxGap === 10 && n.maxDuration === 0 && n.maxChars === 1, '参数夹取到合法范围');
+  const n2 = normalizeMergeOptions({ shortThreshold: 0.3336, maxGap: 0.1235, maxDuration: 7.0004, maxChars: 12.9 });
+  assert(
+    n2.shortThreshold === 0.334 && n2.maxGap === 0.124 && n2.maxDuration === 7 && n2.maxChars === 12,
+    '秒值四舍五入到毫秒、字素数向下取整'
+  );
+  const blank = buildMergePlan(
+    [
+      { id: 'a', start: 0, end: 0.5, text: '   ' },
+      { id: 'b', start: 0.7, end: 1.2, text: '\n\t ' }
+    ],
+    MOPTS
+  );
+  assert(blank.groups[0].text === '' && blank.groups[0].chars === 0, '两条空文本连接后仍为空、0 字素');
+  const empty = buildMergePlan([], MOPTS);
+  assert(empty.resultCount === 0 && empty.mergedAwayCount === 0, '无字幕：空计划');
+}
+
+// 54. 乱序输入按时间序规划；短阈值为 0 时没有「短句」概念，不应产生任何合并
+{
+  const mc = [
+    { id: 'b', start: 0.7, end: 1.2, text: '世界' },
+    { id: 'a', start: 0, end: 0.5, text: '你好' }
+  ];
+  const plan = buildMergePlan(mc, MOPTS);
+  assert(plan.groups[0].members.map((m) => m.cueId).join('') === 'ab', '乱序输入按时间序成组');
+  const noShort = buildMergePlan(mc, { ...MOPTS, shortThreshold: 0 });
+  assert(noShort.shortCount === 0 && noShort.mergedAwayCount === 0, '阈值 0：无短句需消除，不做无收益合并（应用禁用）');
 }
 
 process.exit(fail ? 1 : 0);
